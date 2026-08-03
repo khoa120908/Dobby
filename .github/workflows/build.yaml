@@ -1,4 +1,4 @@
-name: Build Dobby
+name: Build Dobby Android
 
 on:
   push:
@@ -6,70 +6,113 @@ on:
       - master
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: dobby-android-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  NDK_VERSION: r25b
+  NDK_VERSION: r28c
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux
-            runner: ubuntu-latest
-            setup: sh scripts/setup_linux_cross_compile.sh
-            platform_args: ""
-          - platform: android
-            runner: ubuntu-latest
-            setup: sh scripts/setup_linux_cross_compile.sh
-            platform_args: --android_ndk_dir=$HOME/opt/ndk-$NDK_VERSION
-          - platform: macos
-            runner: macos-latest
-            setup: sh scripts/setup_macos_cross_compile.sh
-            platform_args: ""
-          - platform: iphoneos
-            runner: macos-latest
-            setup: sh scripts/setup_macos_cross_compile.sh
-            platform_args: ""
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@master
-      - run: ${{ matrix.setup }}
-      - name: Compile
-        run: |
-          python3 scripts/platform_builder.py --platform=${{ matrix.platform }} --arch=all ${{ matrix.platform_args }}
-          cp include/dobby.h build/${{ matrix.platform }}
-          tar -zcvf build/dobby-${{ matrix.platform }}-all.tar.gz build/${{ matrix.platform }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.platform }}
-          path: build/dobby-${{ matrix.platform }}-all.tar.gz
+  build_android:
+    name: Android NDK r28c
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
 
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
         with:
-          path: artifacts
-      - name: Collect release assets
-        run: |
-          mkdir -p release-assets
-          find artifacts -name '*.tar.gz' -exec cp {} release-assets/ \;
-      - name: Delete old latest release and tag
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install Android NDK
+        id: setup_ndk
+        uses: nttld/setup-ndk@v1.6.0
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+          link-to-sdk: false
+
+      - name: Configure toolchain
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          NDK_PATH: ${{ steps.setup_ndk.outputs.ndk-path }}
         run: |
-          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
-      - name: Create new latest release
-        env:
-          GH_TOKEN: ${{ github.token }}
+          set -euo pipefail
+
+          test -d "$NDK_PATH"
+          test -x "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+
+          echo "ANDROID_NDK_ROOT=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+          cmake --version
+          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version
+
+      - name: Set Android minimum API to 21
+        shell: bash
         run: |
-          gh release create latest \
-            --title "Latest Build (${{ github.sha }})" \
-            --notes "Automated build from commit ${{ github.sha }}" \
-            --target ${{ github.sha }} \
-            release-assets/*.tar.gz
+          set -euo pipefail
+
+          sed -i '/if arch == "armeabi-v7a" or arch == "x86":/,+1d' scripts/platform_builder.py
+
+          if grep -q 'android_api_level = 19' scripts/platform_builder.py; then
+            echo "Failed to update the Android minimum API level"
+            exit 1
+          fi
+
+          python3 -m py_compile scripts/platform_builder.py
+
+      - name: Build Android libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 scripts/platform_builder.py \
+            --platform=android \
+            --arch=all \
+            --android_ndk_dir="$ANDROID_NDK_ROOT"
+
+      - name: Validate build output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for abi in x86 x86_64 armeabi-v7a arm64-v8a; do
+            test -s "build/android/$abi/libdobby.a"
+            test -s "build/android/$abi/libdobby.so"
+            file "build/android/$abi/libdobby.a"
+            file "build/android/$abi/libdobby.so"
+          done
+
+      - name: Package Android libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp include/dobby.h build/android/dobby.h
+
+          (
+            cd build/android
+            for abi in x86 x86_64 armeabi-v7a arm64-v8a; do
+              sha256sum "$abi/libdobby.a" "$abi/libdobby.so"
+            done
+            sha256sum dobby.h
+          ) > build/android/SHA256SUMS
+
+          tar -C build -czf build/dobby-android-r28c-all.tar.gz android
+          tar -tzf build/dobby-android-r28c-all.tar.gz
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dobby-android-r28c-all
+          path: build/dobby-android-r28c-all.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
